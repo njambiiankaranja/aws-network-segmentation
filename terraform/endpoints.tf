@@ -1,0 +1,16 @@
+# A gateway endpoint gives private subnets a direct path to S3 inside AWS's
+# network, without an internet gateway or NAT. It is free, and it keeps S3
+# traffic off the internet.
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+
+  route_table_ids = [
+    aws_route_table.app.id,
+    aws_route_table.data.id,
+  ]
+
+  tags = { Name = "${var.project_name}-s3-endpoint" }
+}
