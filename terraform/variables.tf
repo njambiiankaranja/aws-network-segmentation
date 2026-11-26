@@ -39,3 +39,14 @@ variable "enable_nat" {
   default     = false
   description = "Create a NAT Gateway so the app tier can reach the internet. It costs money every hour, so it is off by default"
 }
+variable "app_port" {
+  type        = number
+  default     = 8080
+  description = "Port the application tier listens on"
+}
+
+variable "db_port" {
+  type        = number
+  default     = 5432
+  description = "Port the database tier listens on (5432 is PostgreSQL)"
+}
