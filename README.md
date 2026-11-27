@@ -103,7 +103,7 @@ A free S3 gateway endpoint lets private and isolated subnets reach S3 through AW
 
 ## Proof: Who Can Reach What
 
-The design is tested, not just described. These checks were run against the deployed network.
+The design is tested, not just described.These checks are run against the deployed network in the final phase, and the results are recorded here.
 
 | From | To | Expected | Result |
 |---|---|---|---|
