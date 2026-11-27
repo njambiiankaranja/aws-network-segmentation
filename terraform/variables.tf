@@ -50,3 +50,9 @@ variable "db_port" {
   default     = 5432
   description = "Port the database tier listens on (5432 is PostgreSQL)"
 }
+
+variable "instance_type" {
+  type        = string
+  default     = "t3.micro"
+  description = "Instance type for the three test servers"
+}
