@@ -1,0 +1,22 @@
+#!/bin/bash
+# Starts a tiny web listener so the tier answers on its port.
+# It needs no internet: Amazon Linux already includes Python.
+mkdir -p /srv/tier
+echo "${tier} tier, port ${port}" > /srv/tier/index.html
+
+cat > /etc/systemd/system/tier.service <<UNIT
+[Unit]
+Description=Tier test listener
+After=network.target
+
+[Service]
+WorkingDirectory=/srv/tier
+ExecStart=/usr/bin/python3 -m http.server ${port}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now tier.service
