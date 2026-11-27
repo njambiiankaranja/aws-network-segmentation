@@ -1,6 +1,6 @@
 # AWS Network Segmentation with Terraform
 
-A custom AWS network built as code, split into public, private and isolated tiers so that each resource is reachable only from where it should be. The design is then tested: a table of connection attempts shows which ones are allowed, which are blocked, and why.
+A custom AWS network built as code, split into public, private and isolated tiers so that each resource is reachable only from where it should be. The design is then tested: a table of real connection attempts shows which ones are allowed, which are blocked, and what the network's own logs recorded.
 
 ---
 
@@ -25,22 +25,24 @@ This is the kind of design a company expects before it moves a real application 
  | VPC 10.0.0.0/16                                      |
  |                                                      |
  |  PUBLIC tier   (route to the internet)               |
- |    web server, load balancer                         |
+ |    web server                                        |
  |         |  app port only                             |
  |         v                                            |
  |  PRIVATE APP tier   (no inbound from the internet)   |
- |    application servers                               |
+ |    app server                                        |
  |         |  database port only                        |
  |         v                                            |
- |  ISOLATED DATA tier   (no route out at all)          |
- |    databases                                         |
+ |  ISOLATED DATA tier   (no route to the internet)     |
+ |    database stand-in                                 |
  |                                                      |
- |  S3 gateway endpoint (free, private path to S3)      |
+ |  S3 gateway endpoint (free)                          |
+ |  Session Manager endpoints (shell access, no SSH)    |
+ |  VPC Flow Logs to CloudWatch                         |
  |  Optional NAT Gateway (app tier outbound only)       |
  +------------------------------------------------------+
 ```
 
-Each tier spans two availability zones, so the loss of one zone does not take a tier down.
+Each tier has subnets in two availability zones, so the loss of one zone does not take a tier down. One small test server per tier is deployed so the rules can be tried for real.
 
 | Tier | Subnets | Route to the internet | Who can reach it |
 |---|---|---|---|
@@ -72,16 +74,18 @@ Because the groups refer to each other, the rules keep working when servers are 
 
 A network ACL filters at the edge of a whole subnet and is stateless, so it checks each direction separately and replies must be allowed explicitly. On the data tier it allows only the database port in from the app subnets, and only the replies out. Anything else is denied. A security group and a network ACL do different jobs, and having both means one misconfiguration does not open the vault.
 
-### 4. Endpoints give private access to AWS services
-
-A free S3 gateway endpoint lets private and isolated subnets reach S3 through AWS's own network, without an internet gateway or NAT.
-
 | | Security group | Network ACL |
 |---|---|---|
 | Applies to | A server | A whole subnet |
 | Stateful | Yes | No |
 | Rules | Allow only | Allow and deny, in numbered order |
 | Refers to other groups | Yes | No, only IP ranges |
+
+### 4. Endpoints give private access to AWS services
+
+A free S3 gateway endpoint lets private and isolated subnets reach S3 through AWS's own network, without an internet gateway or NAT. The route to it exists in the app and data route tables, but a route only says where traffic may go. The data security group has no outbound rules, so the data tier is still refused when it tries to reach S3. To allow it, an outbound rule for the S3 prefix list would be added.
+
+Interface endpoints for Session Manager let the app server, which has no internet, open a shell session without SSH.
 
 ---
 
@@ -95,26 +99,43 @@ A free S3 gateway endpoint lets private and isolated subnets reach S3 through AW
 | No outbound rules on the data group | A database never needs to start a connection, so it is not allowed to |
 | Network ACL on the data tier only | A second layer where the data lives, without making the rest harder to manage |
 | NAT Gateway off by default | It bills every hour. Without it, the app tier has no internet, which is a safe default |
-| S3 gateway endpoint | Free, and keeps S3 traffic off the internet |
-| CIDR ranges planned in blocks | Each tier has its own range with room to add subnets later |
+| Session Manager instead of SSH | No inbound port is ever opened for administration |
+| No shell on the data server | Nobody needs to log in to the vault. It only answers on its port |
+| Flow Logs on the whole VPC | The network's own record of what was accepted and refused |
 | Remote Terraform state in S3 | State is not tied to one computer |
 
 ---
 
 ## Proof: Who Can Reach What
 
-The design is tested, not just described.These checks are run against the deployed network in the final phase, and the results are recorded here.
+The design was tested against the deployed network. The test servers each run a tiny listener on their tier's port. The web and app tests were run from Session Manager shells in the browser, and each blocked attempt used `curl -m 5`, so a drop shows as a 5 second timeout.
 
 | From | To | Expected | Result |
 |---|---|---|---|
-| Internet | Web server on port 80 | Allowed | |
-| Internet | App server | Blocked | |
-| Web tier | App tier on the app port | Allowed | |
-| Web tier | Database port | Blocked | |
-| App tier | Database port | Allowed | |
-| Data tier | Internet | Blocked | |
+| Internet | Web server, port 80 | Allowed | Allowed. Returned the web tier response |
+| Internet | Web server, port 8080 | Blocked | Blocked. Timed out after 5 seconds |
+| Web tier | App server, app port | Allowed | Allowed. Returned the app tier response |
+| Web tier | Database port | Blocked | Blocked. Timed out, and a Flow Log `REJECT` was recorded |
+| App tier | Database port | Allowed | Allowed. Returned the data tier response |
+| Data tier | Internet | Blocked | Blocked. No `0.0.0.0/0` route, and outbound attempts were rejected in the Flow Logs |
 
-The VPC Flow Logs show the blocked attempts as `REJECT` records, which is the evidence that the network refused them and the connection did not simply fail by accident.
+The app and data servers have no public IP address at all, so they cannot be reached from the internet in the first place.
+
+### What the Flow Logs recorded
+
+Each Flow Log record lists: version, account, network interface, source address, destination address, source port, destination port, protocol, packets, bytes, start, end, action and status. Protocol `6` is TCP and `17` is UDP.
+
+**The web server trying the database port:**
+
+```text
+2 <account-id> eni-04d5... 10.0.0.200 10.0.20.165 60910 5432 6 3 180 ... REJECT OK
+```
+
+The source is the web server, the destination is the data server on port 5432, and the action is `REJECT`. Three packets are `curl` retrying until it gave up. This is the network refusing the connection, and not the connection failing for some unrelated reason.
+
+**The data server trying to leave:** shortly after boot, the data server tried to reach Amazon S3 addresses on port 443, probably to check its package repositories. Those outbound connections show as `REJECT`, because the data group has no outbound rules.
+
+**Strangers on the internet:** within minutes of the web server getting a public IP, records appeared of unknown addresses probing it on unusual ports such as 5060, 8089 and 8094. They were all refused, because only port 80 is open. A public address gets scanned almost immediately, which is the reason to open only what is needed.
 
 ---
 
@@ -132,13 +153,17 @@ The cost is the reason it is optional: a NAT Gateway is billed for every hour it
 aws-network-segmentation/
 ├── .github/workflows/terraform-ci.yml   # Runs fmt and validate on every pull request
 ├── terraform/
-│   ├── providers.tf     # Provider versions and S3 backend
-│   ├── variables.tf     # Inputs and defaults
-│   ├── network.tf       # VPC, subnets, route tables, optional NAT
-│   ├── security.tf      # Chained security groups
-│   ├── nacl.tf          # Network ACL for the data tier
-│   ├── endpoints.tf     # S3 gateway endpoint
-│   └── outputs.tf       # IDs of the VPC and subnets
+│   ├── providers.tf           # Provider versions and S3 backend
+│   ├── variables.tf           # Inputs and defaults
+│   ├── network.tf             # VPC, subnets, route tables, optional NAT
+│   ├── security.tf            # Chained security groups
+│   ├── nacl.tf                # Network ACL for the data tier
+│   ├── endpoints.tf           # S3 gateway endpoint
+│   ├── compute.tf             # One test server per tier
+│   ├── ssm.tf                 # Session Manager role and interface endpoints
+│   ├── flowlogs.tf            # VPC Flow Logs to CloudWatch
+│   ├── tier_server.sh.tftpl   # Start-up script for the test listeners
+│   └── outputs.tf             # IPs, subnet IDs and session commands
 ├── .gitignore
 └── README.md
 ```
@@ -155,6 +180,7 @@ aws-network-segmentation/
 | `data_subnet_cidrs` | two `/24` blocks | Isolated data tier subnets |
 | `app_port` | `8080` | Port the app tier listens on |
 | `db_port` | `5432` | Port the database tier listens on |
+| `instance_type` | `t3.micro` | Size of the three test servers |
 | `enable_nat` | `false` | Create a NAT Gateway for the app tier |
 
 ---
@@ -170,7 +196,37 @@ terraform plan
 terraform apply
 ```
 
-The network itself has no hourly cost. Check the subnets and route tables in the AWS console under VPC, and compare the three route tables: only the public one has a route to the internet gateway.
+Wait two to three minutes after the apply so the servers can start and register with Session Manager. The outputs show each server's address and the commands to open a session.
+
+### Running the tests
+
+From your own computer, using the `web_public_ip` output:
+
+```bash
+curl -m 5 http://<web_public_ip>          # expect the web tier response
+curl -m 5 http://<web_public_ip>:8080     # expect a timeout
+```
+
+From the AWS console, open EC2, select the web server and choose Connect, then Session Manager:
+
+```bash
+curl -m 5 http://<app_private_ip>:8080    # expect the app tier response
+curl -m 5 http://<data_private_ip>:5432   # expect a timeout
+```
+
+Open a session on the app server and run:
+
+```bash
+curl -m 5 http://<data_private_ip>:5432   # expect the data tier response
+```
+
+Check the data tier route table has no route to the internet:
+
+```bash
+aws ec2 describe-route-tables --filters Name=tag:Name,Values=netseg-data-rt --query 'RouteTables[].Routes'
+```
+
+Then search the `/vpc/netseg-flow-logs` log group in CloudWatch for `REJECT`. Flow Logs can take a few minutes to appear.
 
 To see the effect of NAT:
 
@@ -202,9 +258,11 @@ Flow Logs speed this up, because a `REJECT` record shows that the network blocke
 
 ## Things to Know
 
-- **The network is free, the extras are not.** Subnets, route tables, security groups and the S3 endpoint cost nothing. A NAT Gateway, interface endpoints, servers and flow log storage bill while they exist.
+- **The network is free, the test setup is not.** Subnets, route tables, security groups and the S3 endpoint cost nothing. The three Session Manager interface endpoints, the three servers and the flow log storage bill while they exist, so destroy the stack when the tests are done.
 - **No inbound SSH.** Servers are reached through AWS Systems Manager Session Manager, so no port 22 is ever opened.
-- **The data tier cannot update itself.** With no route out, servers there cannot download patches. Use patched images, or reach AWS services through endpoints.
+- **The data server has no shell.** That is deliberate. It has no outbound access and no Session Manager role, so it can only be tested from other tiers.
+- **The data tier cannot update itself.** With no outbound access, servers there cannot download patches. Use patched images, or add outbound rules for specific AWS services.
+- **The database is a stand-in.** The data server runs a simple listener on the database port. The network only cares about the port, so a real database would behave the same way.
 - **One NAT Gateway.** The optional NAT sits in one zone. A production setup would use one per zone so a zone failure does not cut off the app tier.
 - **Plain HTTP on the public tier.** This project is about the network layout. HTTPS and certificates are a separate layer.
 
@@ -214,7 +272,7 @@ Flow Logs speed this up, because a `REJECT` record shows that the network blocke
 
 - A load balancer in the public tier in front of the app tier
 - A real database in the data tier, such as RDS PostgreSQL in a subnet group
-- Interface endpoints for more AWS services, so the app tier needs no NAT
-- AWS Network Firewall or security group rules driven by a variable
+- An outbound rule for the S3 prefix list, so the data tier can reach S3 and nothing else
+- AWS Network Firewall or rules driven by a variable
 - A second environment (staging) using the same code with different CIDR ranges
 - Extend the CI pipeline to run `terraform plan` using GitHub Actions OIDC
